@@ -29,13 +29,13 @@ The added OCR libraries render each statement page at high resolution and read t
 Install both desktop programs, then update the configuration near the top of `hdfc_statement_to_excel.py` if your locations differ:
 
 ```python
-OCR_ENGINE = "auto"  # tesseract, rapidocr, or auto
+OCR_ENGINE = "rapidocr"  # recommended for this HDFC scan
 POPPLER_PATH = r"C:\poppler\Library\bin"
 TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 OCR_DPI = 300
 ```
 
-`auto` tries the configured Tesseract + Poppler installation first and falls back to RapidOCR. Use `OCR_ENGINE = "tesseract"` to force Tesseract or `"rapidocr"` to skip it.
+`rapidocr` is the verified default for the supplied statement. Set `OCR_ENGINE = "tesseract"` only to force Poppler + Tesseract, or use `"auto"` to try RapidOCR first and Tesseract only as a fallback.
 
 Then run the single file:
 

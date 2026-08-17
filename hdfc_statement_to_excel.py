@@ -21,9 +21,9 @@ from pypdf import PdfReader, PdfWriter
 
 
 # === OCR CONFIGURATION ===
-# "auto" uses Tesseract when the configured Windows programs exist, otherwise
-# it tries RapidOCR. Set this to "tesseract" or "rapidocr" to force one engine.
-OCR_ENGINE = "auto"
+# RapidOCR produced the best results on the supplied HDFC scan. Tesseract is
+# retained as an optional fallback but is not selected by default.
+OCR_ENGINE = "rapidocr"
 POPPLER_PATH = r"C:\poppler\Library\bin"  # Update if Poppler is elsewhere
 TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 OCR_DPI = 300
@@ -235,6 +235,12 @@ def _page_transactions(page, page_number: int) -> list[Transaction]:
                 pass
         withdrawal = parse_money(raw_withdrawal)
         deposit = parse_money(raw_deposit)
+        # Debit and credit columns contain unsigned amounts. OCR sometimes
+        # mistakes a nearby table rule for a leading minus sign.
+        if withdrawal is not None:
+            withdrawal = abs(withdrawal)
+        if deposit is not None:
+            deposit = abs(deposit)
         balance = parse_money(raw_balance)
         if raw_balance and balance is None:
             warnings.append(f"Could not read closing balance: {raw_balance!r}")
@@ -410,6 +416,12 @@ def _transactions_from_ocr_items(
         value_date = parse_date(raw_value) or date
         withdrawal = parse_money(raw_withdrawal)
         deposit = parse_money(raw_deposit)
+        # Debit and credit columns contain unsigned amounts. OCR sometimes
+        # mistakes a nearby table rule for a leading minus sign.
+        if withdrawal is not None:
+            withdrawal = abs(withdrawal)
+        if deposit is not None:
+            deposit = abs(deposit)
         balance = parse_money(raw_balance)
         if withdrawal is None and deposit is None and balance is None:
             continue
@@ -565,15 +577,17 @@ def convert_statement(source: bytes | BinaryIO, password: str = "") -> Conversio
     elif OCR_ENGINE.lower() == "rapidocr":
         engines = [_rapidocr_transactions]
     else:
-        # The user's configured Windows Tesseract/Poppler installation is the
-        # first choice; RapidOCR remains a no-configuration fallback.
-        engines = [_tesseract_transactions, _rapidocr_transactions]
+        # In automatic mode prefer the engine verified against this statement;
+        # use Tesseract only if RapidOCR is unavailable.
+        engines = [_rapidocr_transactions, _tesseract_transactions]
 
     transactions: list[Transaction] = []
+    engine_used = "PDF text fallback"
     for engine in engines:
         try:
             transactions = engine(pdf_data)
             if transactions:
+                engine_used = "RapidOCR at 216 DPI" if engine is _rapidocr_transactions else "Tesseract at 300 DPI"
                 break
         except (ImportError, OSError, RuntimeError):
             continue
@@ -589,6 +603,16 @@ def convert_statement(source: bytes | BinaryIO, password: str = "") -> Conversio
     except Exception:
         pass
     metadata = _metadata("\n".join(text_parts))
+    balance_checks = 0
+    balance_mismatches = 0
+    for previous, current in zip(transactions, transactions[1:]):
+        values = (previous.closing_balance, current.withdrawal, current.deposit, current.closing_balance)
+        if all(value is not None for value in values):
+            balance_checks += 1
+            expected = previous.closing_balance - current.withdrawal + current.deposit
+            balance_mismatches += abs(expected - current.closing_balance) > Decimal("0.02")
+    metadata["Extraction method"] = engine_used
+    metadata["Balance verification"] = f"{balance_checks - balance_mismatches}/{balance_checks} rows passed"
     warnings: list[str] = []
     review_count = sum(bool(row.warnings) for row in transactions)
     if review_count:
