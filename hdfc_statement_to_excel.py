@@ -20,6 +20,15 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 from pypdf import PdfReader, PdfWriter
 
 
+# === OCR CONFIGURATION ===
+# "auto" uses Tesseract when the configured Windows programs exist, otherwise
+# it tries RapidOCR. Set this to "tesseract" or "rapidocr" to force one engine.
+OCR_ENGINE = "auto"
+POPPLER_PATH = r"C:\poppler\Library\bin"  # Update if Poppler is elsewhere
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+OCR_DPI = 300
+
+
 class StatementError(Exception):
     """A message that can safely be shown to the user."""
 
@@ -354,128 +363,87 @@ def convert_statement(source: bytes | BinaryIO, password: str = "") -> Conversio
 _convert_using_pdf_text = convert_statement
 
 
-def _rapidocr_transactions(pdf_data: bytes) -> list[Transaction]:
-    """Render at 216 DPI and OCR the transaction table from each page."""
-    try:
-        import pymupdf
-        from rapidocr_onnxruntime import RapidOCR
-    except ImportError as exc:
-        raise ImportError("High-accuracy OCR packages are not installed") from exc
-
-    engine = RapidOCR()
-    document = pymupdf.open(stream=pdf_data, filetype="pdf")
+def _transactions_from_ocr_items(
+    items: list[dict], width: float, height: float, page_number: int
+) -> list[Transaction]:
+    """Turn positioned OCR words from either OCR engine into table rows."""
+    edges = [0, .067, .424, .545, .618, .752, .873, 1.01]
+    edges = [edge * width for edge in edges]
+    anchors = [
+        item for item in items
+        if item["x0"] < edges[1] and parse_date(item["text"]) is not None
+    ]
+    anchors.sort(key=lambda item: item["yc"])
     transactions: list[Transaction] = []
+    line_tolerance = width * .014
 
-    for page_number, page in enumerate(document, 1):
-        page_rect = page.rect
-        clip = pymupdf.Rect(
-            page_rect.x0 + page_rect.width * .045,
-            page_rect.y0 + page_rect.height * .292,
-            page_rect.x0 + page_rect.width * .955,
-            page_rect.y0 + page_rect.height * .925,
-        )
-        pixmap = page.get_pixmap(
-            matrix=pymupdf.Matrix(3, 3),
-            colorspace=pymupdf.csGRAY,
-            alpha=False,
-            clip=clip,
-        )
-        result, _ = engine(pixmap.tobytes("png"))
-        if not result:
+    for index, anchor in enumerate(anchors):
+        start_y = anchor["yc"] - line_tolerance
+        end_y = anchors[index + 1]["yc"] - line_tolerance if index + 1 < len(anchors) else height
+        segment = [item for item in items if start_y <= item["yc"] < end_y]
+        baseline = [item for item in segment if abs(item["yc"] - anchor["yc"]) <= line_tolerance]
+
+        def column_text(column: int, source: list[dict] | None = None) -> tuple[str, list[float]]:
+            selected = [
+                item for item in (source if source is not None else segment)
+                if edges[column] <= item["x0"] < edges[column + 1]
+            ]
+            selected.sort(key=lambda item: (item["yc"], item["x0"]))
+            return " ".join(item["text"] for item in selected), [item["confidence"] for item in selected]
+
+        narration, narration_scores = column_text(1)
+        reference, reference_scores = column_text(2, baseline)
+        raw_value, value_scores = column_text(3, baseline)
+        raw_withdrawal, withdrawal_scores = column_text(4, baseline)
+        raw_deposit, deposit_scores = column_text(5, baseline)
+        raw_balance, balance_scores = column_text(6, baseline)
+
+        # A detector may join the reference and value date at their border.
+        joined_date = re.search(r"([0-3]\d[/.-][01]\d[/.-]\d{2,4})$", reference)
+        if joined_date and not raw_value:
+            raw_value = joined_date.group(1)
+            reference = reference[:joined_date.start()].strip()
+
+        if "STATEMENTSUMMARY" in re.sub(r"\W", "", narration.upper()):
+            continue
+        date = parse_date(anchor["text"])
+        value_date = parse_date(raw_value) or date
+        withdrawal = parse_money(raw_withdrawal)
+        deposit = parse_money(raw_deposit)
+        balance = parse_money(raw_balance)
+        if withdrawal is None and deposit is None and balance is None:
             continue
 
-        width = float(pixmap.width)
-        items: list[dict] = []
-        for box, text, confidence in result:
-            xs = [point[0] for point in box]
-            ys = [point[1] for point in box]
-            items.append({
-                "x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys),
-                "yc": (min(ys) + max(ys)) / 2,
-                "text": text.strip(), "confidence": float(confidence),
-            })
+        warnings: list[str] = []
+        if not raw_value:
+            warnings.append("Value date was not detected; transaction date used")
+        if raw_balance and balance is None:
+            warnings.append(f"Could not read closing balance: {raw_balance!r}")
+        scores = narration_scores + reference_scores + value_scores + withdrawal_scores + deposit_scores + balance_scores
+        if scores and min(scores) < .80:
+            warnings.append("One or more fields had low OCR confidence; compare with PDF")
 
-        # Column boundaries are relative to the cropped HDFC table. Using
-        # proportions keeps this valid for A4 PDFs rendered at any DPI.
-        edges = [0, .067, .424, .545, .618, .752, .873, 1.01]
-        edges = [edge * width for edge in edges]
-        anchors = [
-            item for item in items
-            if item["x0"] < edges[1] and parse_date(item["text"]) is not None
-        ]
-        anchors.sort(key=lambda item: item["yc"])
+        reference = re.sub(r"\s+", "", reference)
+        if reference.isdigit() and len(reference) > 16:
+            reference = reference[-16:]
+        transactions.append(Transaction(
+            date=date,
+            narration=re.sub(r"\s+", " ", narration).strip(),
+            reference_no=reference,
+            value_date=value_date,
+            withdrawal=withdrawal,
+            deposit=deposit,
+            closing_balance=balance,
+            page=page_number,
+            raw_date=anchor["text"],
+            raw_value_date=raw_value,
+            warnings=warnings,
+        ))
+    return transactions
 
-        for index, anchor in enumerate(anchors):
-            start_y = anchor["yc"] - 18
-            end_y = anchors[index + 1]["yc"] - 18 if index + 1 < len(anchors) else pixmap.height
-            segment = [item for item in items if start_y <= item["yc"] < end_y]
-            baseline = [item for item in segment if abs(item["yc"] - anchor["yc"]) <= 22]
 
-            def column_text(column: int, source: list[dict] | None = None) -> tuple[str, list[float]]:
-                selected = [
-                    item for item in (source if source is not None else segment)
-                    if edges[column] <= item["x0"] < edges[column + 1]
-                ]
-                selected.sort(key=lambda item: (item["yc"], item["x0"]))
-                return " ".join(item["text"] for item in selected), [item["confidence"] for item in selected]
-
-            narration, narration_scores = column_text(1)
-            reference, reference_scores = column_text(2, baseline)
-            raw_value, value_scores = column_text(3, baseline)
-            raw_withdrawal, withdrawal_scores = column_text(4, baseline)
-            raw_deposit, deposit_scores = column_text(5, baseline)
-            raw_balance, balance_scores = column_text(6, baseline)
-
-            # OCR detection occasionally joins reference number and value date
-            # into one box at their shared border. Split the trailing date.
-            joined_date = re.search(r"([0-3]\d[/.-][01]\d[/.-]\d{2,4})$", reference)
-            if joined_date and not raw_value:
-                raw_value = joined_date.group(1)
-                reference = reference[:joined_date.start()].strip()
-
-            if "STATEMENTSUMMARY" in re.sub(r"\W", "", narration.upper()):
-                continue
-            date = parse_date(anchor["text"])
-            value_date = parse_date(raw_value) or date
-            withdrawal = parse_money(raw_withdrawal)
-            deposit = parse_money(raw_deposit)
-            balance = parse_money(raw_balance)
-            if withdrawal is None and deposit is None and balance is None:
-                continue
-
-            warnings: list[str] = []
-            required = [raw_value, raw_withdrawal, raw_deposit, raw_balance]
-            if not raw_value:
-                warnings.append("Value date was not detected; transaction date used")
-            if raw_balance and balance is None:
-                warnings.append(f"Could not read closing balance: {raw_balance!r}")
-            scores = narration_scores + reference_scores + value_scores + withdrawal_scores + deposit_scores + balance_scores
-            if scores and min(scores) < .90:
-                warnings.append("One or more fields had low OCR confidence; compare with PDF")
-
-            reference = re.sub(r"\s+", "", reference)
-            # HDFC's statement reference field is 16 digits. OCR can pick up a
-            # border stroke as a leading 1, so retain the rightmost 16 digits.
-            if reference.isdigit() and len(reference) > 16:
-                reference = reference[-16:]
-
-            transactions.append(Transaction(
-                date=date,
-                narration=re.sub(r"\s+", " ", narration).strip(),
-                reference_no=reference,
-                value_date=value_date,
-                withdrawal=withdrawal,
-                deposit=deposit,
-                closing_balance=balance,
-                page=page_number,
-                raw_date=anchor["text"],
-                raw_value_date=raw_value,
-                warnings=warnings,
-            ))
-    document.close()
-
-    # Bank balances provide a strong accuracy check that generic OCR does not
-    # have: previous balance - withdrawal + deposit must equal new balance.
+def _validate_running_balances(transactions: list[Transaction]) -> None:
+    """Flag OCR mistakes by applying the bank's running-balance equation."""
     for previous, current in zip(transactions, transactions[1:]):
         values = (previous.closing_balance, current.withdrawal, current.deposit, current.closing_balance)
         if all(value is not None for value in values):
@@ -484,21 +452,133 @@ def _rapidocr_transactions(pdf_data: bytes) -> list[Transaction]:
                 current.warnings.append(
                     f"Balance check failed (calculated {expected:,.2f}); compare this row with the PDF"
                 )
+
+
+def _rapidocr_transactions(pdf_data: bytes) -> list[Transaction]:
+    """Render with PyMuPDF and recognize with local RapidOCR."""
+    try:
+        import pymupdf
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError as exc:
+        raise ImportError("RapidOCR packages are not installed") from exc
+
+    engine = RapidOCR()
+    document = pymupdf.open(stream=pdf_data, filetype="pdf")
+    transactions: list[Transaction] = []
+    for page_number, page in enumerate(document, 1):
+        rect = page.rect
+        clip = pymupdf.Rect(
+            rect.x0 + rect.width * .045, rect.y0 + rect.height * .292,
+            rect.x0 + rect.width * .955, rect.y0 + rect.height * .925,
+        )
+        pixmap = page.get_pixmap(
+            matrix=pymupdf.Matrix(3, 3), colorspace=pymupdf.csGRAY,
+            alpha=False, clip=clip,
+        )
+        result, _ = engine(pixmap.tobytes("png"))
+        items: list[dict] = []
+        for box, text, confidence in result or []:
+            xs, ys = [point[0] for point in box], [point[1] for point in box]
+            items.append({
+                "x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys),
+                "yc": (min(ys) + max(ys)) / 2,
+                "text": text.strip(), "confidence": float(confidence),
+            })
+        transactions.extend(_transactions_from_ocr_items(
+            items, float(pixmap.width), float(pixmap.height), page_number
+        ))
+    document.close()
+    _validate_running_balances(transactions)
+    return transactions
+
+
+def _tesseract_transactions(pdf_data: bytes) -> list[Transaction]:
+    """Render with Poppler and recognize with the configured Tesseract."""
+    try:
+        import os
+        import shutil
+        import pytesseract
+        from pdf2image import convert_from_bytes, pdfinfo_from_bytes
+        from PIL import ImageOps
+        from pytesseract import Output
+    except ImportError as exc:
+        raise ImportError("Tesseract Python packages are not installed") from exc
+
+    poppler_path = POPPLER_PATH if os.path.isdir(POPPLER_PATH) else None
+    tesseract = TESSERACT_CMD if os.path.isfile(TESSERACT_CMD) else shutil.which("tesseract")
+    if not tesseract:
+        raise ImportError(f"Tesseract was not found at {TESSERACT_CMD!r}")
+    # On Windows pdf2image needs the configured Poppler directory. On systems
+    # where pdftoppm is on PATH, poppler_path=None is correct.
+    if os.name == "nt" and not poppler_path:
+        raise ImportError(f"Poppler was not found at {POPPLER_PATH!r}")
+    pytesseract.pytesseract.tesseract_cmd = tesseract
+
+    info = pdfinfo_from_bytes(pdf_data, poppler_path=poppler_path)
+    page_count = int(info["Pages"])
+    transactions: list[Transaction] = []
+    for page_number in range(1, page_count + 1):
+        images = convert_from_bytes(
+            pdf_data, dpi=OCR_DPI, first_page=page_number, last_page=page_number,
+            fmt="png", grayscale=True, thread_count=1, poppler_path=poppler_path,
+        )
+        if not images:
+            continue
+        image = ImageOps.autocontrast(images[0].convert("L"))
+        full_width, full_height = image.size
+        crop = image.crop((
+            int(full_width * .045), int(full_height * .292),
+            int(full_width * .955), int(full_height * .925),
+        ))
+        data = pytesseract.image_to_data(
+            crop, lang="eng", config="--oem 3 --psm 6 -c preserve_interword_spaces=1",
+            output_type=Output.DICT,
+        )
+        items: list[dict] = []
+        for index, text in enumerate(data["text"]):
+            text = text.strip()
+            try:
+                confidence = float(data["conf"][index])
+            except (TypeError, ValueError):
+                confidence = -1
+            if not text or confidence < 0:
+                continue
+            x0, y0 = float(data["left"][index]), float(data["top"][index])
+            item_width, item_height = float(data["width"][index]), float(data["height"][index])
+            items.append({
+                "x0": x0, "x1": x0 + item_width, "y0": y0, "y1": y0 + item_height,
+                "yc": y0 + item_height / 2, "text": text,
+                "confidence": confidence / 100,
+            })
+        transactions.extend(_transactions_from_ocr_items(
+            items, float(crop.width), float(crop.height), page_number
+        ))
+    _validate_running_balances(transactions)
     return transactions
 
 
 def convert_statement(source: bytes | BinaryIO, password: str = "") -> ConversionResult:
-    """Convert with fresh high-resolution OCR, falling back to PDF text."""
+    """Convert with configured OCR, trying alternatives before PDF text."""
     pdf_data = unlock_pdf(source, password)
-    try:
-        transactions = _rapidocr_transactions(pdf_data)
-    except ImportError:
-        return _convert_using_pdf_text(pdf_data)
-    except Exception:
-        # A usable result is preferable when an unusual page defeats the OCR
-        # engine. The original text parser also supports digitally born PDFs.
-        return _convert_using_pdf_text(pdf_data)
+    if OCR_ENGINE.lower() == "tesseract":
+        engines = [_tesseract_transactions]
+    elif OCR_ENGINE.lower() == "rapidocr":
+        engines = [_rapidocr_transactions]
+    else:
+        # The user's configured Windows Tesseract/Poppler installation is the
+        # first choice; RapidOCR remains a no-configuration fallback.
+        engines = [_tesseract_transactions, _rapidocr_transactions]
 
+    transactions: list[Transaction] = []
+    for engine in engines:
+        try:
+            transactions = engine(pdf_data)
+            if transactions:
+                break
+        except (ImportError, OSError, RuntimeError):
+            continue
+        except Exception:
+            continue
     if not transactions:
         return _convert_using_pdf_text(pdf_data)
 

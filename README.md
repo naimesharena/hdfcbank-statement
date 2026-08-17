@@ -19,10 +19,23 @@ A local web application that converts the standard HDFC Bank PDF statement layou
 Python 3.10 or newer is recommended. Install the libraries once:
 
 ```bash
-pip install pdfplumber pypdf openpyxl pymupdf rapidocr-onnxruntime opencv-python-headless
+pip install -r requirements.txt
 ```
 
 The added OCR libraries render each statement page at high resolution and read the scan again instead of trusting the PDF's often-corrupted hidden text. Processing a long statement can take several minutes, but dates and amounts are substantially more accurate and all processing remains local.
+
+### Poppler and Tesseract on Windows
+
+Install both desktop programs, then update the configuration near the top of `hdfc_statement_to_excel.py` if your locations differ:
+
+```python
+OCR_ENGINE = "auto"  # tesseract, rapidocr, or auto
+POPPLER_PATH = r"C:\poppler\Library\bin"
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+OCR_DPI = 300
+```
+
+`auto` tries the configured Tesseract + Poppler installation first and falls back to RapidOCR. Use `OCR_ENGINE = "tesseract"` to force Tesseract or `"rapidocr"` to skip it.
 
 Then run the single file:
 
