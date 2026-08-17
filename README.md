@@ -19,8 +19,10 @@ A local web application that converts the standard HDFC Bank PDF statement layou
 Python 3.10 or newer is recommended. Install the libraries once:
 
 ```bash
-pip install pdfplumber pypdf openpyxl
+pip install pdfplumber pypdf openpyxl pymupdf rapidocr-onnxruntime opencv-python-headless
 ```
+
+The added OCR libraries render each statement page at high resolution and read the scan again instead of trusting the PDF's often-corrupted hidden text. Processing a long statement can take several minutes, but dates and amounts are substantially more accurate and all processing remains local.
 
 Then run the single file:
 

@@ -348,6 +348,175 @@ def convert_statement(source: bytes | BinaryIO, password: str = "") -> Conversio
     workbook = create_workbook(transactions, metadata, warnings)
     return ConversionResult(transactions, metadata, warnings, workbook)
 
+
+# Keep the text-layer parser as a fallback. Scanned statements are more
+# accurate when rendered and OCR'd again at high resolution.
+_convert_using_pdf_text = convert_statement
+
+
+def _rapidocr_transactions(pdf_data: bytes) -> list[Transaction]:
+    """Render at 216 DPI and OCR the transaction table from each page."""
+    try:
+        import pymupdf
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError as exc:
+        raise ImportError("High-accuracy OCR packages are not installed") from exc
+
+    engine = RapidOCR()
+    document = pymupdf.open(stream=pdf_data, filetype="pdf")
+    transactions: list[Transaction] = []
+
+    for page_number, page in enumerate(document, 1):
+        page_rect = page.rect
+        clip = pymupdf.Rect(
+            page_rect.x0 + page_rect.width * .045,
+            page_rect.y0 + page_rect.height * .292,
+            page_rect.x0 + page_rect.width * .955,
+            page_rect.y0 + page_rect.height * .925,
+        )
+        pixmap = page.get_pixmap(
+            matrix=pymupdf.Matrix(3, 3),
+            colorspace=pymupdf.csGRAY,
+            alpha=False,
+            clip=clip,
+        )
+        result, _ = engine(pixmap.tobytes("png"))
+        if not result:
+            continue
+
+        width = float(pixmap.width)
+        items: list[dict] = []
+        for box, text, confidence in result:
+            xs = [point[0] for point in box]
+            ys = [point[1] for point in box]
+            items.append({
+                "x0": min(xs), "x1": max(xs), "y0": min(ys), "y1": max(ys),
+                "yc": (min(ys) + max(ys)) / 2,
+                "text": text.strip(), "confidence": float(confidence),
+            })
+
+        # Column boundaries are relative to the cropped HDFC table. Using
+        # proportions keeps this valid for A4 PDFs rendered at any DPI.
+        edges = [0, .067, .424, .545, .618, .752, .873, 1.01]
+        edges = [edge * width for edge in edges]
+        anchors = [
+            item for item in items
+            if item["x0"] < edges[1] and parse_date(item["text"]) is not None
+        ]
+        anchors.sort(key=lambda item: item["yc"])
+
+        for index, anchor in enumerate(anchors):
+            start_y = anchor["yc"] - 18
+            end_y = anchors[index + 1]["yc"] - 18 if index + 1 < len(anchors) else pixmap.height
+            segment = [item for item in items if start_y <= item["yc"] < end_y]
+            baseline = [item for item in segment if abs(item["yc"] - anchor["yc"]) <= 22]
+
+            def column_text(column: int, source: list[dict] | None = None) -> tuple[str, list[float]]:
+                selected = [
+                    item for item in (source if source is not None else segment)
+                    if edges[column] <= item["x0"] < edges[column + 1]
+                ]
+                selected.sort(key=lambda item: (item["yc"], item["x0"]))
+                return " ".join(item["text"] for item in selected), [item["confidence"] for item in selected]
+
+            narration, narration_scores = column_text(1)
+            reference, reference_scores = column_text(2, baseline)
+            raw_value, value_scores = column_text(3, baseline)
+            raw_withdrawal, withdrawal_scores = column_text(4, baseline)
+            raw_deposit, deposit_scores = column_text(5, baseline)
+            raw_balance, balance_scores = column_text(6, baseline)
+
+            # OCR detection occasionally joins reference number and value date
+            # into one box at their shared border. Split the trailing date.
+            joined_date = re.search(r"([0-3]\d[/.-][01]\d[/.-]\d{2,4})$", reference)
+            if joined_date and not raw_value:
+                raw_value = joined_date.group(1)
+                reference = reference[:joined_date.start()].strip()
+
+            if "STATEMENTSUMMARY" in re.sub(r"\W", "", narration.upper()):
+                continue
+            date = parse_date(anchor["text"])
+            value_date = parse_date(raw_value) or date
+            withdrawal = parse_money(raw_withdrawal)
+            deposit = parse_money(raw_deposit)
+            balance = parse_money(raw_balance)
+            if withdrawal is None and deposit is None and balance is None:
+                continue
+
+            warnings: list[str] = []
+            required = [raw_value, raw_withdrawal, raw_deposit, raw_balance]
+            if not raw_value:
+                warnings.append("Value date was not detected; transaction date used")
+            if raw_balance and balance is None:
+                warnings.append(f"Could not read closing balance: {raw_balance!r}")
+            scores = narration_scores + reference_scores + value_scores + withdrawal_scores + deposit_scores + balance_scores
+            if scores and min(scores) < .90:
+                warnings.append("One or more fields had low OCR confidence; compare with PDF")
+
+            reference = re.sub(r"\s+", "", reference)
+            # HDFC's statement reference field is 16 digits. OCR can pick up a
+            # border stroke as a leading 1, so retain the rightmost 16 digits.
+            if reference.isdigit() and len(reference) > 16:
+                reference = reference[-16:]
+
+            transactions.append(Transaction(
+                date=date,
+                narration=re.sub(r"\s+", " ", narration).strip(),
+                reference_no=reference,
+                value_date=value_date,
+                withdrawal=withdrawal,
+                deposit=deposit,
+                closing_balance=balance,
+                page=page_number,
+                raw_date=anchor["text"],
+                raw_value_date=raw_value,
+                warnings=warnings,
+            ))
+    document.close()
+
+    # Bank balances provide a strong accuracy check that generic OCR does not
+    # have: previous balance - withdrawal + deposit must equal new balance.
+    for previous, current in zip(transactions, transactions[1:]):
+        values = (previous.closing_balance, current.withdrawal, current.deposit, current.closing_balance)
+        if all(value is not None for value in values):
+            expected = previous.closing_balance - current.withdrawal + current.deposit
+            if abs(expected - current.closing_balance) > Decimal("0.02"):
+                current.warnings.append(
+                    f"Balance check failed (calculated {expected:,.2f}); compare this row with the PDF"
+                )
+    return transactions
+
+
+def convert_statement(source: bytes | BinaryIO, password: str = "") -> ConversionResult:
+    """Convert with fresh high-resolution OCR, falling back to PDF text."""
+    pdf_data = unlock_pdf(source, password)
+    try:
+        transactions = _rapidocr_transactions(pdf_data)
+    except ImportError:
+        return _convert_using_pdf_text(pdf_data)
+    except Exception:
+        # A usable result is preferable when an unusual page defeats the OCR
+        # engine. The original text parser also supports digitally born PDFs.
+        return _convert_using_pdf_text(pdf_data)
+
+    if not transactions:
+        return _convert_using_pdf_text(pdf_data)
+
+    text_parts: list[str] = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_data)) as pdf:
+            text_parts = [page.extract_text() or "" for page in pdf.pages]
+    except Exception:
+        pass
+    metadata = _metadata("\n".join(text_parts))
+    warnings: list[str] = []
+    review_count = sum(bool(row.warnings) for row in transactions)
+    if review_count:
+        warnings.append(f"{review_count} row(s) should be compared with the PDF.")
+    workbook = create_workbook(transactions, metadata, warnings)
+    return ConversionResult(transactions, metadata, warnings, workbook)
+
+
 # ---------------------------------------------------------------------------
 # Desktop file-selection interface
 # ---------------------------------------------------------------------------
@@ -356,7 +525,7 @@ def run_desktop_converter() -> None:
     """Open a PDF chooser immediately, then save the converted Excel file."""
     try:
         import tkinter as tk
-        from tkinter import filedialog, messagebox, simpledialog
+        from tkinter import filedialog, messagebox, simpledialog, ttk
     except ImportError as exc:
         raise SystemExit(
             "Tkinter is required for the file-selection window. On Ubuntu/Debian, "
@@ -396,20 +565,40 @@ def run_desktop_converter() -> None:
             root.destroy()
             return
 
+    progress = tk.Toplevel(root)
+    progress.title("Reading scanned statement")
+    progress.resizable(False, False)
+    progress.protocol("WM_DELETE_WINDOW", lambda: None)
+    tk.Label(
+        progress,
+        text="Running high-accuracy OCR…\nThis can take several minutes for a long statement.",
+        padx=30,
+        pady=18,
+        justify="center",
+    ).pack()
+    progress_bar = ttk.Progressbar(progress, mode="indeterminate", length=320)
+    progress_bar.pack(padx=25, pady=(0, 22))
+    progress_bar.start(12)
+    progress.update()
+
     try:
         result = convert_statement(pdf_data, password)
     except WrongPasswordError:
+        progress.destroy()
         messagebox.showerror("Incorrect password", "The PDF password is incorrect.", parent=root)
         root.destroy()
         return
     except StatementError as exc:
+        progress.destroy()
         messagebox.showerror("Conversion failed", str(exc), parent=root)
         root.destroy()
         return
     except Exception as exc:
+        progress.destroy()
         messagebox.showerror("Conversion failed", f"Unexpected error: {exc}", parent=root)
         root.destroy()
         return
+    progress.destroy()
 
     from pathlib import Path
 
