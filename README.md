@@ -12,29 +12,34 @@ A local web application that converts the standard HDFC Bank PDF statement layou
 - Marks OCR fields that need manual review
 - Processes the PDF and password in memory; the app does not save either one
 
-## Run
+## Single-file desktop version
 
-Python 3.10 or newer is recommended.
+`hdfc_statement_to_excel.py` is completely self-contained application code. Running it immediately opens the operating system's PDF file-selection window. If the selected PDF is encrypted, it then displays a masked password prompt, followed by an Excel save dialog.
 
-### Windows
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-### macOS / Linux
+Python 3.10 or newer is recommended. Install the libraries once:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+pip install pdfplumber pypdf openpyxl
+```
+
+Then run the single file:
+
+```bash
+python hdfc_statement_to_excel.py
+```
+
+On some Ubuntu/Debian installations, the desktop dialog library must first be installed with `sudo apt install python3-tk`. Tkinter is already included with normal Python installations on Windows and macOS.
+
+## Browser version
+
+A Streamlit browser interface is also available:
+
+```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Streamlit opens the file-selection interface in your browser. Select the statement, enter a password only when the PDF is protected, and click **Convert to Excel**.
+Select the statement, enter a password only when the PDF is protected, and click **Convert to Excel**.
 
 ## Supported files
 
