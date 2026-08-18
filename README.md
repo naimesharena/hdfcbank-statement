@@ -50,6 +50,23 @@ python app.py
 
 `app.py` detects a normal Python launch and automatically restarts itself using Streamlit. This avoids the `missing ScriptRunContext` warnings produced when a Streamlit script is run in bare mode.
 
+### Windows Tesseract detection
+
+The app automatically checks the standard installer location:
+
+```text
+C:\Program Files\Tesseract-OCR\tesseract.exe
+```
+
+If Tesseract is installed somewhere else, set its full path before starting the app:
+
+```powershell
+$env:TESSERACT_CMD = "D:\YourFolder\Tesseract-OCR\tesseract.exe"
+python app.py
+```
+
+For a permanent setting, search Windows for **Edit environment variables**, create a user variable named `TESSERACT_CMD`, and set its value to the full `tesseract.exe` path.
+
 ## Password handling and privacy
 
 The upload is processed in memory. A supplied password is passed directly to PyMuPDF to unlock the document; it is not written to disk or included in the output workbook. When deploying publicly, remember that processing occurs on the server running Streamlit.

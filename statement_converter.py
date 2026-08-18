@@ -7,10 +7,12 @@ written to disk.
 from __future__ import annotations
 
 import io
+import os
 import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Iterable
 
 import pymupdf
@@ -48,12 +50,37 @@ class Transaction:
     raw_text: str
 
 
+def find_tesseract() -> str | None:
+    """Locate Tesseract on PATH or in its common Windows install folders."""
+    configured = os.environ.get("TESSERACT_CMD", "").strip().strip('"')
+    candidates = [configured] if configured else []
+
+    on_path = shutil.which("tesseract") or shutil.which("tesseract.exe")
+    if on_path:
+        candidates.append(on_path)
+
+    # The Windows installer does not always add Tesseract to PATH.
+    candidates.extend([
+        str(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Tesseract-OCR" / "tesseract.exe"),
+        str(Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Tesseract-OCR" / "tesseract.exe"),
+        str(Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / "tesseract.exe"),
+    ])
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(Path(candidate))
+    return None
+
+
 def check_tesseract() -> None:
-    """Raise a friendly error when the OCR executable is unavailable."""
-    if not shutil.which("tesseract"):
+    """Configure pytesseract or raise a friendly installation error."""
+    executable = find_tesseract()
+    if not executable:
         raise StatementError(
-            "Tesseract OCR is not installed. Install `tesseract-ocr` and restart the app."
+            "Tesseract OCR was not found. On Windows it is normally installed at "
+            "C:\\Program Files\\Tesseract-OCR\\tesseract.exe. If yours is elsewhere, "
+            "set the TESSERACT_CMD environment variable to its full path and restart the app."
         )
+    pytesseract.pytesseract.tesseract_cmd = executable
 
 
 def open_document(data: bytes, filename: str, password: str = ""):

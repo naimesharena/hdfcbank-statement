@@ -1,3 +1,4 @@
+import statement_converter
 from statement_converter import OCRPage, parse_transactions
 
 
@@ -22,3 +23,14 @@ TO EXAMPLE BENEFICIARY
     rows = parse_transactions(pages)
     assert "EXAMPLE BENEFICIARY" in rows[0].narration
     assert rows[0].page == 2
+
+
+def test_configures_tesseract_from_environment(tmp_path, monkeypatch):
+    executable = tmp_path / "tesseract.exe"
+    executable.touch()
+    monkeypatch.setenv("TESSERACT_CMD", str(executable))
+    monkeypatch.setattr(statement_converter.shutil, "which", lambda _: None)
+
+    statement_converter.check_tesseract()
+
+    assert statement_converter.pytesseract.pytesseract.tesseract_cmd == str(executable)
