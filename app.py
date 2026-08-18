@@ -2,8 +2,33 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
+import sys
+from pathlib import Path
 
 import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+
+def _start_streamlit_when_run_as_python() -> None:
+    """Make `python app.py` work instead of producing bare-mode warnings.
+
+    Streamlit normally expects `streamlit run app.py`. Windows users commonly
+    launch a Python file from an IDE or by double-clicking it, so transparently
+    start the proper Streamlit process in that situation.
+    """
+    if __name__ == "__main__" and get_script_run_ctx(suppress_warning=True) is None:
+        app_path = str(Path(__file__).resolve())
+        print("Starting the Bank Statement Converter in your browser...")
+        try:
+            raise SystemExit(
+                subprocess.call([sys.executable, "-m", "streamlit", "run", app_path])
+            )
+        except KeyboardInterrupt:
+            raise SystemExit(0) from None
+
+
+_start_streamlit_when_run_as_python()
 
 from statement_converter import (
     StatementError,

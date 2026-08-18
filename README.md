@@ -40,6 +40,16 @@ streamlit run app.py
 
 Open the URL shown by Streamlit, select the statement, enter its PDF password if needed, choose the page range, and click **Convert to Excel**.
 
+### Windows shortcuts
+
+You can also double-click **`run_app.bat`**, or run the Python file from an IDE:
+
+```powershell
+python app.py
+```
+
+`app.py` detects a normal Python launch and automatically restarts itself using Streamlit. This avoids the `missing ScriptRunContext` warnings produced when a Streamlit script is run in bare mode.
+
 ## Password handling and privacy
 
 The upload is processed in memory. A supplied password is passed directly to PyMuPDF to unlock the document; it is not written to disk or included in the output workbook. When deploying publicly, remember that processing occurs on the server running Streamlit.
