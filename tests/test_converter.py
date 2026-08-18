@@ -25,6 +25,23 @@ TO EXAMPLE BENEFICIARY
     assert rows[0].page == 2
 
 
+def test_parses_decimal_commas_created_by_ocr():
+    pages = [OCRPage(1, """| 17/05/25 UPI PAYMENT 0000104988540205 17/05/25 | 390,00 | 0.00 4,660.00 |
+i 16/09/25 IMPS CREDIT 0000525914347851 16/09/25 i 0.00 1,00 i 1.00
+| 26/O9/25 FT SETTLEMENT 0000001250409785 26/O9/25 : 0.00 i 598,24 2,556.86""", 75)]
+
+    rows = parse_transactions(pages)
+
+    assert len(rows) == 3
+    assert rows[0].withdrawal == 390
+    assert rows[0].deposit is None
+    assert rows[0].balance == 4660
+    assert rows[1].withdrawal is None
+    assert rows[1].deposit == 1
+    assert rows[2].deposit == 598.24
+    assert rows[2].balance == 2556.86
+
+
 def test_configures_tesseract_from_environment(tmp_path, monkeypatch):
     executable = tmp_path / "tesseract.exe"
     executable.touch()

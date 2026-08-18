@@ -22,8 +22,20 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
-DATE_PATTERN = re.compile(r"(?<!\d)(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})(?!\d)")
-AMOUNT_PATTERN = re.compile(r"(?<!\w)(?:₹\s*)?([\dOoIl][\dOoIl,]*\.\d{2})(?:\s*(?:CR|DR))?", re.I)
+# Dates also tolerate common scanner substitutions (O -> 0, I/l -> 1).
+_DATE_DIGIT = r"0-9OoIl"
+DATE_PATTERN = re.compile(
+    rf"(?<![{_DATE_DIGIT}])([{_DATE_DIGIT}]{{1,2}}[./-]"
+    rf"[{_DATE_DIGIT}]{{1,2}}[./-][{_DATE_DIGIT}]{{2,4}})(?![{_DATE_DIGIT}])"
+)
+# Indian statements normally use 1,234.56, but Tesseract frequently reads the
+# decimal point as a comma (for example 390.00 -> 390,00). Accept both forms.
+_DIGIT = r"\dOoIl"
+AMOUNT_PATTERN = re.compile(
+    rf"(?<!\w)(?:₹\s*)?([+-]?(?:[{_DIGIT}][{_DIGIT},]*\.[{_DIGIT}]{{2}}|"
+    rf"[{_DIGIT}]+,[{_DIGIT}]{{2}}))(?:\s*(?:CR|DR))?",
+    re.I,
+)
 
 
 class StatementError(Exception):
@@ -177,10 +189,14 @@ def ocr_document(
 
 
 def _amount(value: str) -> float | None:
-    cleaned = value.replace("₹", "").replace(",", "").replace(" ", "")
+    cleaned = value.replace("₹", "").replace(" ", "")
     # Common OCR substitutions inside numeric fields.
     cleaned = cleaned.translate(str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1"}))
-    if cleaned.count(".") == 0 and cleaned.count(",") == 1:
+    if "." in cleaned:
+        # A period is the decimal mark, so any commas are thousands separators.
+        cleaned = cleaned.replace(",", "")
+    elif cleaned.count(",") == 1:
+        # OCR often changes a decimal point to a comma: 390.00 -> 390,00.
         cleaned = cleaned.replace(",", ".")
     try:
         return float(cleaned)
@@ -189,6 +205,7 @@ def _amount(value: str) -> float | None:
 
 
 def _normalise_date(value: str) -> str:
+    value = value.translate(str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1"}))
     value = value.replace(".", "/").replace("-", "/")
     for fmt in ("%d/%m/%Y", "%d/%m/%y"):
         try:
@@ -271,7 +288,9 @@ def parse_transactions(pages: Iterable[OCRPage]) -> list[Transaction]:
         if row.withdrawal is not None or row.deposit is not None:
             continue
         amount = getattr(row, "_transaction_amount", None)
-        if amount is None:
+        # With only "0.00 + balance", OCR probably missed the non-zero debit or
+        # credit column. Leave both blank instead of reporting a false zero.
+        if amount is None or amount == 0:
             continue
         previous = transactions[index - 1] if index else None
         if previous and previous.balance is not None and row.balance is not None:
